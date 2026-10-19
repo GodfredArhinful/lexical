@@ -169,3 +169,15 @@ export const MarkExtension = defineExtension({
 });
 
 export {$createMarkNode, $isMarkNode, MarkNode, type SerializedMarkNode};
+export {
+  $addMarkID,
+  $getMarkIDsAtSelection,
+  $getNodeMarkIDs,
+  $migrateMarkNodesToMarkState,
+  $removeMarkID,
+  MARK_STATE_IDS_ATTRIBUTE,
+  MARK_STATE_KEY_PREFIX,
+  type MarkStateConfig,
+  MarkStateExtension,
+  type MarkStateOutput,
+} from './MarkStateExtension';

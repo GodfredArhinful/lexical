@@ -576,6 +576,63 @@ export function $getState<K extends string, V>(
 }
 
 /**
+ * List the string keys of the NodeState entries on `node` that may hold a
+ * non-default value, so that state with dynamically named keys (for example
+ * one key per id, sharing a prefix) can be discovered and then read with
+ * {@link $getState}.
+ *
+ * The result includes every key whose value was set (with {@link $setState}
+ * or parsed by {@link $getState}) to something that is not `isEqual` to its
+ * StateConfig's `defaultValue`, and every key that was carried in from
+ * serialized JSON (or a collaboration peer) and has not been parsed by a
+ * StateConfig yet. The value of such an unparsed key is unknown until it is
+ * read with a StateConfig, so a caller should confirm it with
+ * {@link $getState}. Symbol keys are never serialized and are not included.
+ * The order of the keys is unspecified.
+ *
+ * @example
+ * ```ts
+ * const ids = $getStateKeys(node)
+ *   .filter(key => key.startsWith('tag:'))
+ *   .map(key => key.slice('tag:'.length));
+ * ```
+ *
+ * @param node Any LexicalNode
+ * @param version {@link NODE_STATE_LATEST} (the default) reads the latest version of the node, {@link NODE_STATE_DIRECT} reads the version stored on this LexicalNode
+ * @returns The keys, without duplicates
+ *
+ * @experimental
+ */
+export function $getStateKeys(
+  node: LexicalNode,
+  version: NodeStateVersion = NODE_STATE_LATEST,
+): string[] {
+  const latestOrDirectNode =
+    version === NODE_STATE_LATEST ? node.getLatest() : node;
+  const state = latestOrDirectNode.__state;
+  const keys = new Set<string>();
+  if (state) {
+    for (const [stateConfig, value] of state.knownState) {
+      if (
+        typeof stateConfig.key === 'string' &&
+        !stateConfig.isEqual(value, stateConfig.defaultValue)
+      ) {
+        keys.add(stateConfig.key);
+      }
+    }
+    const {unknownState} = state;
+    if (unknownState) {
+      for (const key in unknownState) {
+        if (unknownState[key] !== undefined) {
+          keys.add(key);
+        }
+      }
+    }
+  }
+  return Array.from(keys);
+}
+
+/**
  * Given two versions of a node and a stateConfig, compare their state values
  * using `$getState(nodeVersion, stateConfig, NODE_STATE_DIRECT)`.
  * If the values are equal according to `stateConfig.isEqual`, return `null`,

@@ -241,6 +241,7 @@ export {$isLexicalNode, buildImportMap} from './LexicalNode';
 export {
   $getState,
   $getStateChange,
+  $getStateKeys,
   $getWritableNodeState,
   $setState,
   type AnyStateConfig,

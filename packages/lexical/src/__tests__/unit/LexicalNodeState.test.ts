@@ -13,6 +13,7 @@ import {
   $getRoot,
   $getState,
   $getStateChange,
+  $getStateKeys,
   $isParagraphNode,
   $setState,
   createEditor,
@@ -504,6 +505,70 @@ describe('LexicalNode state', () => {
           1,
         );
       });
+      describe('$getStateKeys', () => {
+        test('lists keys with a non-default or unparsed value', () => {
+          const {editor} = testEnv;
+          const tagA = createState('tag:a', {parse: v => v === true});
+          const tagB = createState('tag:b', {parse: v => v === true});
+          editor.update(
+            () => {
+              const node = $createTextNode('x');
+              expect($getStateKeys(node)).toEqual([]);
+              $setState(node, tagA, true);
+              $setState(node, tagB, true);
+              $setState(node, numberState, 0);
+              expect($getStateKeys(node).sort()).toEqual(['tag:a', 'tag:b']);
+              // Back to the default value
+              $setState(node, tagB, false);
+              expect($getStateKeys(node)).toEqual(['tag:a']);
+
+              // Keys from JSON that no StateConfig has read yet
+              const imported = $createTextNode('y').updateFromJSON({
+                ...$createTextNode('y').exportJSON(),
+                [NODE_STATE_KEY]: {'tag:a': true, 'tag:unknown': 1},
+              });
+              expect($getStateKeys(imported).sort()).toEqual([
+                'tag:a',
+                'tag:unknown',
+              ]);
+              expect($getState(imported, tagA)).toBe(true);
+              expect($getStateKeys(imported).sort()).toEqual([
+                'tag:a',
+                'tag:unknown',
+              ]);
+            },
+            {discrete: true},
+          );
+        });
+
+        test('reads the latest or the direct version', () => {
+          const {editor} = testEnv;
+          const tag = createState('tag', {parse: v => v === true});
+          let key = '';
+          editor.update(
+            () => {
+              const node = $createTextNode('x');
+              $getRoot().clear().append($createParagraphNode().append(node));
+              key = node.getKey();
+            },
+            {discrete: true},
+          );
+          const before = editor.getEditorState();
+          editor.update(
+            () => {
+              const node = $getRoot().getAllTextNodes()[0];
+              $setState(node, tag, true);
+            },
+            {discrete: true},
+          );
+          const prevNode = before._nodeMap.get(key)!;
+          editor.read(() => {
+            expect($getStateKeys(prevNode)).toEqual(['tag']);
+            expect($getStateKeys(prevNode, NODE_STATE_DIRECT)).toEqual([]);
+          });
+        });
+      });
+
       describe('nodeStatesAreEquivalent', () => {
         test('undefined states are equivalent', () => {
           expect(nodeStatesAreEquivalent(undefined, undefined)).toBe(true);
