@@ -28,13 +28,14 @@ import {
   type ElementNode,
   getDeclaredSlots,
   isLexicalEditor,
+  type LexicalEditor,
   type LexicalNode,
   type NodeKey,
   type NodeMap,
   type RangeSelection,
   type TextNode,
 } from 'lexical';
-import {Doc, Map as YMap, XmlElement, XmlText} from 'yjs';
+import {ContentType, Doc, Map as YMap, XmlElement, XmlText} from 'yjs';
 
 import {isBindingV1} from './Bindings';
 import {
@@ -50,6 +51,183 @@ import {$createCollabTextNode, CollabTextNode} from './CollabTextNode';
 
 // Mirrors the file-local alias used in CollabElementNode / CollabDecoratorNode.
 type IntentionallyMarkedAsDirtyElement = boolean;
+
+// The unregistered node types each editor has met in a shared document.
+let unregisteredTypes: WeakMap<LexicalEditor, Set<string>> | undefined;
+
+/**
+ * Whether this editor can materialize a node of `type`. A collaborator running
+ * a build with more node classes (e.g. while a new node type rolls out) can
+ * write types this editor has never registered. Such content is "opaque": it
+ * is kept in the shared document, untouched, but has no Lexical node here.
+ *
+ * An unregistered type is remembered (see {@link hasUnregisteredNodeTypes})
+ * and reported once per editor and type (see reportUnregisteredNodeType).
+ */
+export function isRegisteredNodeType(
+  binding: BaseBinding,
+  type: string,
+): boolean {
+  const editor = binding.editor;
+  if (editor._nodes.has(type)) {
+    return true;
+  }
+  if (unregisteredTypes === undefined) {
+    unregisteredTypes = new WeakMap();
+  }
+  let types = unregisteredTypes.get(editor);
+  if (types === undefined) {
+    types = new Set();
+    unregisteredTypes.set(editor, types);
+  }
+  if (!types.has(type)) {
+    types.add(type);
+    reportUnregisteredNodeType(editor, type);
+  }
+  return false;
+}
+
+// Reported through the editor's `onWarn`, the handler for conditions the
+// editor has recovered from, so that applications can route it to telemetry
+// in production. This runs in the middle of applying a remote change, which
+// must not be aborted, so a handler that throws (the default one does, in
+// development) is downgraded to a console warning.
+function reportUnregisteredNodeType(editor: LexicalEditor, type: string) {
+  const warning = new Error(
+    `Collaboration: node type "${type}" is not registered on this editor. ` +
+      'Content of this type from other collaborators is kept in the shared ' +
+      'document but is not shown here. Register the node class to show it.',
+  );
+  try {
+    editor._onWarn(warning);
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+/**
+ * Whether this editor has met an unregistered node type. Until it has, no
+ * content it has materialized can be opaque, which lets the hot paths skip
+ * the content checks.
+ */
+export function hasUnregisteredNodeTypes(binding: BaseBinding): boolean {
+  const types =
+    unregisteredTypes === undefined
+      ? undefined
+      : unregisteredTypes.get(binding.editor);
+  return types !== undefined && types.size > 0;
+}
+
+/**
+ * Whether `sharedType`, or a shared type it is nested in, stands for a node
+ * type this editor does not register. Changes inside such a subtree stay in
+ * Yjs only.
+ */
+export function isInOpaqueSharedType(
+  binding: Binding,
+  sharedType: XmlText | YMap<unknown> | XmlElement,
+): boolean {
+  const rootSharedType = binding.root.getSharedType();
+  let type: null | {parent: unknown} = sharedType;
+  while (type != null && type !== rootSharedType) {
+    if (
+      type instanceof XmlText ||
+      type instanceof XmlElement ||
+      type instanceof YMap
+    ) {
+      // `__state` and `__slots` maps carry no `__type`; neither does a shared
+      // type that has been deleted.
+      const nodeType = sharedTypeGet(type, '__type');
+      if (
+        typeof nodeType === 'string' &&
+        !isRegisteredNodeType(binding, nodeType)
+      ) {
+        return true;
+      }
+    }
+    type = type.parent as null | {parent: unknown};
+  }
+  return false;
+}
+
+// The content half of isOpaqueCollabNode per element. It depends only on the
+// element's own children, which only a remote change can turn opaque (this
+// editor cannot create a type it does not register), so it is computed when
+// an element is first read from Yjs and refreshed when a remote change to its
+// children arrives.
+let opaqueContentCache: WeakMap<CollabElementNode, boolean> | undefined;
+
+function hasOpaqueContentAmongText(
+  binding: Binding,
+  collabNode: CollabElementNode,
+): boolean {
+  let hasText = false;
+  let hasOpaqueChild = false;
+  for (
+    let item = collabNode._xmlText._start;
+    item !== null;
+    item = item.right
+  ) {
+    if (!item.deleted && item.content instanceof ContentType) {
+      const childType = item.content.type;
+      const nodeType = sharedTypeGet(
+        childType as XmlText | XmlElement | YMap<unknown>,
+        '__type',
+      );
+      if (typeof nodeType === 'string') {
+        if (childType instanceof YMap && nodeType !== 'linebreak') {
+          hasText = true;
+        }
+        if (!isRegisteredNodeType(binding, nodeType)) {
+          hasOpaqueChild = true;
+        }
+      }
+    }
+  }
+  return hasText && hasOpaqueChild;
+}
+
+/**
+ * Whether this editor shows no Lexical node for `collabNode`: its type is not
+ * registered, or it is an element that holds such content among text nodes.
+ * Skipping only the unknown child there would leave its text neighbours
+ * adjacent in Lexical, where normalization merges them and the merge is
+ * written back over the unknown node, so the whole element is skipped.
+ *
+ * A skipped element keeps its collab node, and its children stay in step with
+ * Yjs, so that it can be shown again once the content is gone.
+ *
+ * Pass `refresh` after a remote change to the element's children.
+ */
+export function isOpaqueCollabNode(
+  binding: Binding,
+  collabNode:
+    | CollabElementNode
+    | CollabTextNode
+    | CollabDecoratorNode
+    | CollabLineBreakNode,
+  refresh: boolean = false,
+): boolean {
+  if (!isRegisteredNodeType(binding, collabNode.getType())) {
+    return true;
+  }
+  if (!(collabNode instanceof CollabElementNode)) {
+    return false;
+  }
+  if (opaqueContentCache === undefined) {
+    opaqueContentCache = new WeakMap();
+  }
+  let result = refresh ? undefined : opaqueContentCache.get(collabNode);
+  if (result === undefined) {
+    if (!refresh && collabNode._key !== '') {
+      // Created by this editor, so it holds only registered types.
+      return false;
+    }
+    result = hasOpaqueContentAmongText(binding, collabNode);
+    opaqueContentCache.set(collabNode, result);
+  }
+  return result;
+}
 
 // @experimental named-slots. Slots are a structural channel separate from the
 // linked-list children (excluded from the auto property->attribute path via the
@@ -415,14 +593,15 @@ export function $getOrInitCollabNodeFromSharedType(
   const collabNode = sharedType._collabNode;
 
   if (collabNode === undefined) {
-    const registeredNodes = binding.editor._nodes;
     const type = getNodeTypeFromSharedType(sharedType);
     invariant(
       typeof type === 'string',
       'Expected shared type to include type attribute',
     );
-    const nodeInfo = registeredNodes.get(type);
-    invariant(nodeInfo !== undefined, 'Node %s is not registered', type);
+    // An unregistered type still gets a collab node, so that the parent's
+    // child offsets stay in step with Yjs, but no Lexical node
+    // (isOpaqueCollabNode). Checking it here records the type.
+    isRegisteredNodeType(binding, type);
 
     const sharedParent = sharedType.parent;
     const targetParent =
@@ -486,7 +665,11 @@ export function createLexicalNodeFromCollabNode(
   if (collabNode instanceof CollabElementNode) {
     const xmlText = collabNode._xmlText;
     collabNode.syncPropertiesFromYjs(binding, null);
-    collabNode.applyChildrenYjsDelta(binding, xmlText.toDelta());
+    // An element shown again after it held content this editor cannot show
+    // already has its children, kept in step with Yjs while it was hidden.
+    if (collabNode._children.length === 0) {
+      collabNode.applyChildrenYjsDelta(binding, xmlText.toDelta());
+    }
     collabNode.syncChildrenFromYjs(binding);
   } else if (collabNode instanceof CollabTextNode) {
     collabNode.syncPropertiesAndTextFromYjs(binding, null);
@@ -939,7 +1122,12 @@ export function $syncSlotsFromYjsShared(
       existingCollab.getSharedType() === slotSharedType
     ) {
       // Same shared type still occupies this name; its own observer syncs
-      // the slot's content, so leave the slot in place.
+      // the slot's content, so leave the slot in place, unless it now holds
+      // content this editor cannot show.
+      if (isOpaqueCollabNode(binding, existingCollab)) {
+        existingCollab.destroy(binding);
+        $removeSlot(lexicalNode, name);
+      }
       continue;
     }
     // An uninitialized shared type can only be materialized with a string
@@ -980,6 +1168,18 @@ export function $syncSlotsFromYjsShared(
       slotSharedType,
       ownerCollab,
     );
+    if (isOpaqueCollabNode(binding, slotCollab)) {
+      // Content this editor cannot show stays in Yjs only. A stale local
+      // occupant of the name is dropped, so that the next local edit of the
+      // host does not write it back over the value.
+      if (existingSlot !== null) {
+        if (existingCollab !== undefined) {
+          existingCollab.destroy(binding);
+        }
+        $removeSlot(lexicalNode, name);
+      }
+      continue;
+    }
     const slotLexicalNode = createLexicalNodeFromCollabNode(
       binding,
       slotCollab,
@@ -1040,6 +1240,14 @@ export function $syncSlotsFromLexicalShared(
       // remote data) has no `_collabNode` and nothing to destroy.
       const removed = slotsY.get(name) as XmlText | XmlElement | undefined;
       const removedCollab = removed == null ? undefined : removed._collabNode;
+      if (
+        removedCollab !== undefined
+          ? isOpaqueCollabNode(binding, removedCollab)
+          : removed != null && isInOpaqueSharedType(binding, removed)
+      ) {
+        // Never shown here, so its absence from Lexical is not a removal.
+        continue;
+      }
       if (removedCollab !== undefined) {
         removedCollab.destroy(binding);
       }
